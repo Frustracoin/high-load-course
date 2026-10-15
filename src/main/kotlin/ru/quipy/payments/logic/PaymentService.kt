@@ -8,6 +8,16 @@ interface PaymentService {
      * Submit payment request to some external service.
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+
+    /**
+     * Reserve a place for the payment if it can be processed before the deadline.
+     */
+    fun tryAcceptPayment(deadline: Long): Boolean
+
+    /**
+     * Timestamp (ms) after which it makes sense to retry a rejected payment.
+     */
+    fun retryAfter(): Long
 }
 
 /**
@@ -18,6 +28,10 @@ interface PaymentService {
  */
 interface PaymentExternalSystemAdapter {
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+
+    fun tryAcceptPayment(deadline: Long): Boolean
+
+    fun retryAfter(): Long
 
     fun name(): String
 

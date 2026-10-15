@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -36,7 +37,17 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    private val acceptedPayments = Metrics.counter("shop_payment_requests", "result", "accepted")
+    private val rejectedPayments = Metrics.counter("shop_payment_requests", "result", "rejected")
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        // Не берём оплату, которую не успеем провести до дедлайна: просим клиента прийти позже, вместо того чтобы платить провайдеру за опоздавший запрос
+        if (!paymentService.tryAcceptPayment(deadline)) {
+            rejectedPayments.increment()
+            throw PaymentRejectedException(paymentService.retryAfter())
+        }
+        acceptedPayments.increment()
+
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
@@ -53,3 +64,5 @@ class OrderPayer {
         return createdAt
     }
 }
+
+class PaymentRejectedException(val retryAfter: Long) : RuntimeException("Payment can't be processed before the deadline")
