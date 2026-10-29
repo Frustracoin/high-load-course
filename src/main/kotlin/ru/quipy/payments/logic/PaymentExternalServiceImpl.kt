@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Tags
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -13,6 +15,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -44,7 +47,39 @@ class PaymentExternalSystemAdapterImpl(
     // Не больше parallelRequests запросов одновременно в полёте; fair - чтобы ожидающие шли по FIFO и ранние оплаты не опоздали к дедлайну
     private val parallelLimiter = Semaphore(parallelRequests, true)
 
+    // Оплаты, принятые на этот аккаунт и ещё не завершённые: ждут в очереди или уже выполняются
+    private val backlog = Metrics.gauge("shop_payment_backlog", Tags.of("account", accountName), AtomicInteger(0))!!
+
+    private val providerRequests = Metrics.counter("shop_provider_requests", "account", accountName)
+
+    // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в rate limit, либо в окно parallelRequests
+    private val throughputPerSec = minOf(rateLimitPerSec.toDouble(), parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis())
+
+    // Время ответа сильно разбросано, поэтому оставляем запас: по расчёту хвост (p99.9) превышает среднее на ~3 averageProcessingTime
+    private val deadlineSafetyMargin = requestAverageProcessingTime.multipliedBy(4)
+
+    override fun tryAcceptPayment(deadline: Long): Boolean {
+        while (true) {
+            val queued = backlog.get()
+            // Перед нами queued оплат, аккаунт пропускает throughputPerSec оплат в секунду
+            val expectedFinish = now() + ((queued + 1) * 1000 / throughputPerSec).toLong() + deadlineSafetyMargin.toMillis()
+            if (expectedFinish > deadline) return false
+            if (backlog.compareAndSet(queued, queued + 1)) return true
+        }
+    }
+
+    // В среднем одно место в очереди освобождается раз в 1 / throughputPerSec секунд
+    override fun retryAfter() = now() + (1000 / throughputPerSec).toLong()
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        try {
+            performPayment(paymentId, amount, paymentStartedAt)
+        } finally {
+            backlog.decrementAndGet()
+        }
+    }
+
+    private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -66,6 +101,7 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            providerRequests.increment()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)

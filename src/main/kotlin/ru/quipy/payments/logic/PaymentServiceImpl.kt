@@ -26,4 +26,8 @@ class PaymentSystemImpl(
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
+
+    override fun tryAcceptPayment(deadline: Long) = paymentAccounts.all { it.tryAcceptPayment(deadline) }
+
+    override fun retryAfter() = paymentAccounts.minOf { it.retryAfter() }
 }
