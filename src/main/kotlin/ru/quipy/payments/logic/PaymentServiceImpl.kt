@@ -27,7 +27,9 @@ class PaymentSystemImpl(
         }
     }
 
-    override fun tryAcceptPayment(deadline: Long) = paymentAccounts.all { it.tryAcceptPayment(deadline) }
+    override fun parallelism() = paymentAccounts.sumOf { it.parallelism() }
+
+    override fun canProcessInTime(queued: Int, deadline: Long) = paymentAccounts.all { it.canProcessInTime(queued, deadline) }
 
     override fun retryAfter() = paymentAccounts.minOf { it.retryAfter() }
 }

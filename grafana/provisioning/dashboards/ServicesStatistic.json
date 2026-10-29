@@ -3606,7 +3606,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "description": "Оплаты, принятые на аккаунт и ещё не завершённые (в очереди + в обработке)",
+          "description": "Оплаты в очереди пула OrderPayer, которые ждут свободного потока",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -3652,13 +3652,13 @@
                 "uid": "PBFA97CFB590B2093"
               },
               "editorMode": "code",
-              "expr": "sum by (account) (shop_payment_backlog)",
-              "legendFormat": "{{account}}",
+              "expr": "shop_payment_queue_size",
+              "legendFormat": "queue",
               "range": true,
               "refId": "A"
             }
           ],
-          "title": "Payments backlog (accepted, not finished)",
+          "title": "Payments queue size (waiting for a thread)",
           "type": "timeseries"
         }
       ]
