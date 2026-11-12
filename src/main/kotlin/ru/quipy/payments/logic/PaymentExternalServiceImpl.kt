@@ -70,7 +70,7 @@ class PaymentExternalSystemAdapterImpl(
         SlidingWindowReservations(rateLimitPerSec, rateLimitWindow)
     }
 
-    // Сколько реально длится оплата у этого аккаунта (от момента отправки до записи результата): меряем на лету
+    // Сколько реально длится оплата у этого аккаунта (от момента отправки до ответа провайдера): меряем на лету
     private val executionStats = LatencyStats()
 
     // До первых замеров опираемся на то, что обещает провайдер: время ответа в среднем avg,
