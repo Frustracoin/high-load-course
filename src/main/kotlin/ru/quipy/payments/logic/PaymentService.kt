@@ -10,9 +10,14 @@ interface PaymentService {
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     /**
-     * Reserve a place for the payment if it can be processed before the deadline.
+     * How many payments should be processed concurrently to use the accounts at full speed.
      */
-    fun tryAcceptPayment(deadline: Long): Boolean
+    fun parallelism(): Int
+
+    /**
+     * Whether a payment with [queued] payments ahead of it can be processed before the deadline.
+     */
+    fun canProcessInTime(queued: Int, deadline: Long): Boolean
 
     /**
      * Timestamp (ms) after which it makes sense to retry a rejected payment.
@@ -29,7 +34,9 @@ interface PaymentService {
 interface PaymentExternalSystemAdapter {
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
-    fun tryAcceptPayment(deadline: Long): Boolean
+    fun parallelism(): Int
+
+    fun canProcessInTime(queued: Int, deadline: Long): Boolean
 
     fun retryAfter(): Long
 

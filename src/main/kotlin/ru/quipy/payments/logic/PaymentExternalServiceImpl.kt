@@ -8,6 +8,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LatencyStats
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -15,7 +16,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
-import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.sqrt
 
 
 // Advice: always treat time as a Duration
@@ -41,41 +42,67 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    // Окно чуть больше секунды: запас на сетевой джиттер, чтобы провайдер не увидел > rateLimitPerSec в своём окне
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1100))
+    // Провайдер считает лимит за секунду по своим часам (время прихода), а мы - по времени отправки.
+    // Одно разрешение оставляем на запрос, который сетевая задержка может сдвинуть в соседнее окно провайдера
+    private val rateLimitWindow = Duration.ofSeconds(1)
+    private val ourRateLimit = rateLimitPerSec - 1
+    private val rateLimiter = SlidingWindowRateLimiter(ourRateLimit.toLong(), rateLimitWindow)
 
     // Не больше parallelRequests запросов одновременно в полёте; fair - чтобы ожидающие шли по FIFO и ранние оплаты не опоздали к дедлайну
     private val parallelLimiter = Semaphore(parallelRequests, true)
 
-    // Оплаты, принятые на этот аккаунт и ещё не завершённые: ждут в очереди или уже выполняются
-    private val backlog = Metrics.gauge("shop_payment_backlog", Tags.of("account", accountName), AtomicInteger(0))!!
-
     private val providerRequests = Metrics.counter("shop_provider_requests", "account", accountName)
 
-    // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в rate limit, либо в окно parallelRequests
-    private val throughputPerSec = minOf(rateLimitPerSec.toDouble(), parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis())
+    // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в наш rate limiter, либо в окно parallelRequests
+    private val rateBound = ourRateLimit * 1000.0 / rateLimitWindow.toMillis()
+    private val windowBound = parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis()
+    private val throughputPerSec = minOf(rateBound, windowBound)
 
-    // Время ответа сильно разбросано, поэтому оставляем запас: по расчёту хвост (p99.9) превышает среднее на ~3 averageProcessingTime
-    private val deadlineSafetyMargin = requestAverageProcessingTime.multipliedBy(4)
+    // Сколько реально длится оплата у этого аккаунта (от взятия из очереди до ответа провайдера): меряем на лету
+    private val executionStats = LatencyStats()
 
-    override fun tryAcceptPayment(deadline: Long): Boolean {
-        while (true) {
-            val queued = backlog.get()
-            // Перед нами queued оплат, аккаунт пропускает throughputPerSec оплат в секунду
-            val expectedFinish = now() + ((queued + 1) * 1000 / throughputPerSec).toLong() + deadlineSafetyMargin.toMillis()
-            if (expectedFinish > deadline) return false
-            if (backlog.compareAndSet(queued, queued + 1)) return true
+    init {
+        Metrics.gauge("shop_payment_execution_max_ms", Tags.of("account", accountName), executionStats) {
+            it.snapshot()?.maxMs?.toDouble() ?: 0.0
         }
     }
 
-    // В среднем одно место в очереди освобождается раз в 1 / throughputPerSec секунд
+    // Закон Литтла: чтобы держать throughputPerSec при среднем времени avg, одновременно нужно throughputPerSec * avg вызовов (+10% запаса).
+    // Больше parallelRequests брать бессмысленно: лишние потоки просто ждали бы на семафоре
+    override fun parallelism(): Int {
+        val inFlight = Math.ceil(throughputPerSec * requestAverageProcessingTime.toMillis() / 1000.0).toInt()
+        return minOf(parallelRequests, inFlight + Math.ceil(inFlight * 0.1).toInt())
+    }
+
+    override fun canProcessInTime(queued: Int, deadline: Long): Boolean {
+        // Пока замеров нет (холодный старт), ничего не знаем о времени выполнения: в очередь не ставим, берём только на свободный поток
+        val stats = executionStats.snapshot() ?: return queued == 0
+
+        // Перед нами queued оплат в очереди, они уходят к провайдеру со скоростью throughputPerSec
+        val waitInQueue = (queued + 1) * 1000 / throughputPerSec
+
+        // Если упираемся в окно, места освобождаются в случайные моменты (когда кто-то из parallelRequests закончил),
+        // и ожидание (queued + 1) освобождений разбросано на sigma * sqrt(queued + 1) / parallelRequests. Берём 3 сигмы.
+        // Если упираемся в rate limit, разрешения выдаются строго по времени и разброса нет
+        val waitJitter = if (windowBound < rateBound) {
+            3 * stats.stdMs * sqrt(queued + 1.0) / parallelRequests
+        } else 0.0
+
+        // Своя оплата: худшее замеренное время из последних 1000 оплат
+        val execution = stats.maxMs
+
+        return now() + waitInQueue + waitJitter + execution <= deadline
+    }
+
+    // В среднем место в очереди освобождается раз в 1 / throughputPerSec секунд
     override fun retryAfter() = now() + (1000 / throughputPerSec).toLong()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val startedAt = now()
         try {
             performPayment(paymentId, amount, paymentStartedAt)
         } finally {
-            backlog.decrementAndGet()
+            executionStats.record(now() - startedAt)
         }
     }
 
