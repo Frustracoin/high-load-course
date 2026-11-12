@@ -27,7 +27,7 @@ class PaymentSystemImpl(
         }
     }
 
-    override fun parallelism(deadline: Long) = paymentAccounts.sumOf { it.parallelism(deadline) }
+    override fun parallelism() = paymentAccounts.sumOf { it.parallelism() }
 
     // Оплата уходит во все аккаунты, поэтому отправлять её можно, когда подошёл слот у каждого
     override fun reserveSendSlot(deadline: Long): Long? {
