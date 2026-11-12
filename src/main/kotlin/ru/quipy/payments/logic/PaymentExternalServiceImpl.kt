@@ -8,7 +8,6 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.SlidingWindowReservations
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -63,35 +62,29 @@ class PaymentExternalSystemAdapterImpl(
     // Худшее время ответа: провайдер обещает среднее averageProcessingTime, ответ разбросан от нуля - значит, не дольше 2 * avg
     private val worstProcessingTime = requestAverageProcessingTime.multipliedBy(2)
 
-    // Входной лимитер: бронирует каждой принятой оплате момент отправки к провайдеру.
-    // Если упираемся в rate limit - то же скользящее окно, что и на выходе, но длиннее на шаг опроса выходного лимитера:
-    // к моменту брони разрешение там уже точно освободилось, и запросы не накапливают отставание от расписания.
-    // Этот же зазор - запас на разброс доставки, ведь провайдер считает лимит по времени прихода.
-    // Если упираемся в окно - parallelRequests отправок за averageProcessingTime (столько освобождается мест в окне)
-    private val sendSchedule = SlidingWindowReservations(if (windowBound < rateBound) parallelRequests else rateLimitPerSec)
-    private val scheduleWindow = if (windowBound < rateBound) {
-        requestAverageProcessingTime
-    } else {
-        rateLimitWindow + SlidingWindowRateLimiter.POLL_INTERVAL
+    // Входной лимитер - leaky bucket в форме GCRA: оплаты уходят к провайдеру ровно по одной раз в period.
+    // Тогда k-я в очереди уйдёт не позже now + k * period, и можно заранее сказать, успеет ли она к дедлайну
+    private val sendPeriodMillis = Math.ceil(1000 / throughputPerSec).toLong()
+    private var nextSendAt = 0L
+
+    // Пул не должен становиться узким местом: столько потоков, сколько провайдер разрешает запросов одновременно
+    override fun parallelism(): Int = parallelRequests
+
+    // Берём оплату, только если даже самый долгий ответ после её момента отправки успеет к дедлайну
+    @Synchronized
+    override fun reserveSendSlot(deadline: Long): Long? {
+        val slot = maxOf(now(), nextSendAt)
+        if (slot + worstProcessingTime.toMillis() > deadline) return null
+        nextSendAt = slot + sendPeriodMillis
+        return slot
     }
 
-    // Закон Литтла с верхней границей времени: оплата, которая длится дольше, чем клиент готов ждать, уже никому не нужна,
-    // поэтому одновременно в полёте не больше throughputPerSec * (дедлайн - сейчас) оплат. Столько потоков пул никогда
-    // не станет узким местом. Больше parallelRequests брать бессмысленно - лишние ждали бы на семафоре
-    override fun parallelism(deadline: Long): Int {
-        val inFlight = Math.ceil(throughputPerSec * (deadline - now()) / 1000.0).toInt()
-        return inFlight.coerceIn(1, parallelRequests)
-    }
-
-    // Берём оплату, только если даже самый долгий ответ после забронированного момента успеет к дедлайну
-    override fun reserveSendSlot(deadline: Long): Long? =
-        sendSchedule.reserve(now(), scheduleWindow) { slot -> slot + worstProcessingTime.toMillis() <= deadline }
-
-    // Когда запрос с тем же запасом времени до дедлайна уже поместится: ближайший слот минус этот запас
+    // Когда запрос с тем же запасом времени до дедлайна уже поместится: ближайший момент отправки минус этот запас
+    @Synchronized
     override fun retryAfter(deadline: Long): Long {
         val now = now()
         val budget = deadline - now - worstProcessingTime.toMillis()
-        return maxOf(now + (1000 / throughputPerSec).toLong(), sendSchedule.nextSlot(now, scheduleWindow) - budget)
+        return maxOf(now + sendPeriodMillis, nextSendAt - budget)
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
