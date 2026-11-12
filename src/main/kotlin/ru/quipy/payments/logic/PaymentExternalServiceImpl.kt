@@ -9,6 +9,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.LatencyStats
+import ru.quipy.common.utils.RecentOutcomes
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowReservations
 import ru.quipy.core.EventSourcingService
@@ -19,7 +20,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import kotlin.math.sqrt
+import java.util.concurrent.atomic.AtomicLong
 
 
 // Advice: always treat time as a Duration
@@ -35,9 +36,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-
-        // Число попыток ограничиваем всегда: дедлайн ограничивает время, но при быстрых ошибках не число платных вызовов
-        private const val MAX_ATTEMPTS = 3
     }
 
     private val serviceName = properties.serviceName
@@ -80,59 +78,52 @@ class PaymentExternalSystemAdapterImpl(
     // Сколько реально длится оплата у этого аккаунта (от забронированного момента отправки до ответа провайдера): меряем на лету
     private val executionStats = LatencyStats()
 
-    // До первых замеров опираемся на то, что обещает провайдер: время ответа в среднем avg,
-    // считаем его равномерным от 0 до 2 * avg (это же даёт и худшее время 2 * avg)
-    private val declaredStats = requestAverageProcessingTime.toMillis().let { avg ->
-        LatencyStats.Snapshot(meanMs = avg.toDouble(), stdMs = avg / sqrt(3.0), maxMs = 2 * avg)
+    // Текущая оценка худшего времени оплаты. Пока замеров нет, знаем только обещанное провайдером среднее avg
+    private val worstExecutionMs = Metrics.gauge(
+        "shop_payment_execution_max_ms", Tags.of("account", accountName), AtomicLong(requestAverageProcessingTime.toMillis())
+    )!!
+
+    // Худший замер за последнее время. Горизонт - сколько ждёт клиент (дедлайн из запроса): за это время
+    // успевает пройти достаточно оплат, а старый выброс не влияет на решения дольше, чем живёт сам запрос
+    private fun estimateWorstExecutionMs(horizon: Duration): Long {
+        val worst = executionStats.maxOver(horizon) ?: requestAverageProcessingTime.toMillis()
+        worstExecutionMs.set(worst)
+        return worst
     }
 
-    init {
-        Metrics.gauge("shop_payment_execution_max_ms", Tags.of("account", accountName), executionStats) {
-            it.snapshot()?.maxMs?.toDouble() ?: 0.0
-        }
-    }
-
-    // Закон Литтла с худшим временем вызова: одновременно в полёте до throughputPerSec * 2 * avg вызовов
-    // (провайдер обещает среднее avg, худшее по замерам ~2 * avg). Больше parallelRequests брать бессмысленно
+    // Закон Литтла с худшим временем: одновременно в полёте до throughputPerSec * худшее время вызовов,
+    // столько потоков нужно, чтобы пул не стал узким местом. Больше parallelRequests брать бессмысленно
     override fun parallelism(): Int {
-        val inFlight = Math.ceil(throughputPerSec * 2 * requestAverageProcessingTime.toMillis() / 1000.0).toInt()
-        return minOf(parallelRequests, inFlight)
+        val inFlight = Math.ceil(throughputPerSec * worstExecutionMs.get() / 1000.0).toInt()
+        return inFlight.coerceIn(1, parallelRequests)
     }
-
-    // Худшее время оплаты: замеренное, но не меньше обещанного провайдером (время ответа до 2 * avg)
-    private fun worstExecutionMs(stats: LatencyStats.Snapshot) = maxOf(stats.maxMs, declaredStats.maxMs)
 
     override fun reserveSendSlot(deadline: Long): Long? {
         val now = now()
-        val stats = executionStats.snapshot() ?: declaredStats
-        return sendSchedule.reserve(now) { slot -> slot + waitJitter(slot - now, stats) + worstExecutionMs(stats) <= deadline }
-    }
-
-    // Если упираемся в окно, слоты освобождаются в случайные моменты (когда кто-то из parallelRequests закончил),
-    // и ожидание разбросано на sigma * sqrt(впереди + 1) / parallelRequests. Берём 3 сигмы.
-    // Если упираемся в rate limit, разрешения выдаются строго по времени и разброса нет
-    private fun waitJitter(waitMs: Long, stats: LatencyStats.Snapshot): Double {
-        if (windowBound >= rateBound) return 0.0
-        val ahead = waitMs * throughputPerSec / 1000
-        return 3 * stats.stdMs * sqrt(ahead + 1.0) / parallelRequests
+        val worst = estimateWorstExecutionMs(Duration.ofMillis(deadline - now))
+        return sendSchedule.reserve(now) { slot -> slot + worst <= deadline }
     }
 
     // Когда запрос с тем же запасом времени до дедлайна уже поместится: ближайший слот минус этот запас
     override fun retryAfter(deadline: Long): Long {
         val now = now()
-        val budget = deadline - now - worstExecutionMs(executionStats.snapshot() ?: declaredStats)
+        val budget = deadline - now - worstExecutionMs.get()
         return maxOf(now + (1000 / throughputPerSec).toLong(), sendSchedule.nextSlot(now) - budget)
     }
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, sendAt: Long) {
-        // Повторяем временные ошибки, пока новая попытка успевает до дедлайна: её момент отправки бронируем так же,
-        // как для первой, поэтому повторы не нарушают лимиты аккаунта и не отнимают слоты у уже принятых оплат.
-        // Число попыток ограничено и явно: при быстрых ошибках один только дедлайн разрешил бы много платных попыток подряд
-        var attemptSendAt = sendAt
-        for (attempt in 1..MAX_ATTEMPTS) {
-            if (attemptPayment(paymentId, amount, paymentStartedAt, deadline, attemptSendAt) != AttemptResult.RETRIABLE_FAILURE) return
-            if (attempt == MAX_ATTEMPTS) return
+    // Исходы попыток у этого аккаунта: доля успешных - оценка того, что следующая попытка пройдёт
+    private val attemptOutcomes = RecentOutcomes()
 
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, sendAt: Long) {
+        var attemptSendAt = sendAt
+        while (attemptPayment(paymentId, amount, paymentStartedAt, deadline, attemptSendAt) == AttemptResult.RETRIABLE_FAILURE) {
+            // Повторяем, только пока повтор выгоден: каждая попытка стоит price, а приносит amount с вероятностью,
+            // которую видим по недавним попыткам. Если провайдер начнёт отвечать ошибками, повторы прекратятся сами
+            val successRate = attemptOutcomes.successRateOver(Duration.ofMillis(deadline - paymentStartedAt)) ?: 1.0
+            if (successRate * amount <= properties.price) return
+
+            // И только пока новая попытка успевает до дедлайна: её момент отправки бронируем так же, как для первой,
+            // поэтому повторы не нарушают лимиты аккаунта и не отнимают слоты у уже принятых оплат
             attemptSendAt = reserveSendSlot(deadline) ?: return
             retries.increment()
             Thread.sleep(maxOf(0, attemptSendAt - now()))
@@ -186,6 +177,7 @@ class PaymentExternalSystemAdapterImpl(
             executionStats.record(now() - startedAt)
             logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
             logProcessing(paymentId, transactionId, if (e is InterruptedIOException) "Request timeout." else e.message)
+            attemptOutcomes.record(success = false)
             return if (Thread.currentThread().isInterrupted) AttemptResult.FAILURE else AttemptResult.RETRIABLE_FAILURE
         } finally {
             parallelLimiter.release()
@@ -209,6 +201,7 @@ class PaymentExternalSystemAdapterImpl(
             code == 429 || code >= 500 || code in 200..299 -> AttemptResult.RETRIABLE_FAILURE
             else -> AttemptResult.FAILURE
         }
+        attemptOutcomes.record(success = body.result)
 
         // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
         // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
