@@ -21,15 +21,19 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, sendAt: Long) {
         for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, sendAt)
         }
     }
 
-    override fun parallelism() = paymentAccounts.sumOf { it.parallelism() }
+    override fun parallelism(deadline: Long) = paymentAccounts.sumOf { it.parallelism(deadline) }
 
-    override fun canProcessInTime(queued: Int, deadline: Long) = paymentAccounts.all { it.canProcessInTime(queued, deadline) }
+    // Оплата уходит во все аккаунты, поэтому отправлять её можно, когда подошёл слот у каждого
+    override fun reserveSendSlot(deadline: Long): Long? {
+        val slots = paymentAccounts.map { it.reserveSendSlot(deadline) ?: return null }
+        return slots.max()
+    }
 
-    override fun retryAfter() = paymentAccounts.minOf { it.retryAfter() }
+    override fun retryAfter(deadline: Long) = paymentAccounts.maxOf { it.retryAfter(deadline) }
 }

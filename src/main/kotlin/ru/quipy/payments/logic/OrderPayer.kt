@@ -9,9 +9,7 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
@@ -27,26 +25,13 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // Явная очередь оплат, которые ждут свободного потока. Сколько в неё можно положить, решаем по дедлайну (см. processPayment),
-    // а ёмкость - лишь страховка по памяти
-    private val paymentQueue = ArrayBlockingQueue<Runnable>(8_000).also { queue ->
-        Metrics.gauge("shop_payment_queue_size", queue) { it.size.toDouble() }
-    }
-
-    // Потоков ровно столько, сколько оплат аккаунты могут вести одновременно: лишние потоки ждали бы внутри
-    // rate limiter / семафора, то есть образовали бы ещё одну, неявную очередь. При переполнении - отказ, а не блокировка вызывающего
+    // Каждая принятая оплата ставится в очередь на свой забронированный момент отправки (см. processPayment).
+    // Очередь планировщика упорядочена по этому моменту; её длину ограничивает бронирование по дедлайну.
+    // Задача стартует в свой слот и не ждёт лимитеров; число потоков - по закону Литтла (см. parallelism)
     private val paymentExecutor by lazy {
-        val threads = paymentService.parallelism()
-        logger.info("Payment executor threads: $threads")
-        ThreadPoolExecutor(
-            threads,
-            threads,
-            0L,
-            TimeUnit.MILLISECONDS,
-            paymentQueue,
-            NamedThreadFactory("payment-submission-executor"),
-            ThreadPoolExecutor.AbortPolicy()
-        )
+        ScheduledThreadPoolExecutor(1, NamedThreadFactory("payment-submission-executor")).also { executor ->
+            Metrics.gauge("shop_payment_queue_size", executor) { it.queue.size.toDouble() }
+        }
     }
 
     private val acceptedPayments = Metrics.counter("shop_payment_requests", "result", "accepted")
@@ -54,13 +39,19 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         // Не берём оплату, которую не успеем провести до дедлайна: просим клиента прийти позже, вместо того чтобы платить провайдеру за опоздавший запрос
-        if (!paymentService.canProcessInTime(paymentQueue.size, deadline)) {
-            reject()
+        val sendAt = paymentService.reserveSendSlot(deadline) ?: reject(deadline)
+
+        // Число потоков зависит от того, сколько ждёт клиент (дедлайн из запроса), поэтому считаем его по запросу
+        val threads = paymentService.parallelism(deadline)
+        if (threads != paymentExecutor.corePoolSize) {
+            logger.info("Payment executor threads: ${paymentExecutor.corePoolSize} -> $threads")
+            paymentExecutor.corePoolSize = threads
         }
 
         val createdAt = System.currentTimeMillis()
-        try {
-            paymentExecutor.submit {
+        paymentExecutor.schedule({
+            // Исключение внутри задачи планировщик молча сохранил бы в никем не читаемый Future, поэтому логируем сами
+            try {
                 val createdEvent = paymentESService.create {
                     it.create(
                         paymentId,
@@ -70,18 +61,18 @@ class OrderPayer {
                 }
                 logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline, sendAt)
+            } catch (e: Exception) {
+                logger.error("Payment $paymentId for order $orderId failed", e)
             }
-        } catch (e: RejectedExecutionException) {
-            reject()
-        }
+        }, sendAt - createdAt, TimeUnit.MILLISECONDS)
         acceptedPayments.increment()
         return createdAt
     }
 
-    private fun reject(): Nothing {
+    private fun reject(deadline: Long): Nothing {
         rejectedPayments.increment()
-        throw PaymentRejectedException(paymentService.retryAfter())
+        throw PaymentRejectedException(paymentService.retryAfter(deadline))
     }
 }
 

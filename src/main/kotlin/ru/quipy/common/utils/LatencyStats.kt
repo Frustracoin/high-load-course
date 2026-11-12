@@ -1,38 +1,49 @@
 package ru.quipy.common.utils
 
+import java.time.Duration
 import kotlin.math.sqrt
 
 /**
- * Статистика по последним [capacity] замерам длительности (в мс): среднее, стандартное отклонение и максимум.
- * Пока замеров меньше [minSamples], snapshot() возвращает null.
+ * Замеры длительности (в мс) с моментом записи. maxOver / meanOver / stdOver(horizon) - худший, средний замер и разброс
+ * среди записанных не раньше чем horizon назад.
+ *
+ * Горизонт задаёт вызывающий: так статистика всегда отражает недавнее поведение, а один выброс
+ * не влияет на решения дольше этого горизонта.
  */
-class LatencyStats(
-    private val capacity: Int = 1000,
-    private val minSamples: Int = 20,
-) {
-    private val samples = LongArray(capacity)
-    private var count = 0
-    private var next = 0
-    private var cached: Snapshot? = null
+class LatencyStats {
+    private val samples = ArrayDeque<Sample>()
+    private var horizon = Duration.ZERO
 
     @Synchronized
     fun record(millis: Long) {
-        samples[next] = millis
-        next = (next + 1) % capacity
-        if (count < capacity) count++
-        cached = null
+        samples.addLast(Sample(System.currentTimeMillis(), millis))
+        dropOlderThan(horizon)
     }
 
     @Synchronized
-    fun snapshot(): Snapshot? {
-        if (count < minSamples) return null
-        cached?.let { return it }
-
-        val window = samples.copyOf(count)
-        val mean = window.average()
-        val std = sqrt(window.sumOf { (it - mean) * (it - mean) } / count)
-        return Snapshot(mean, std, window.max()).also { cached = it }
+    fun maxOver(horizon: Duration): Long? {
+        dropOlderThan(horizon)
+        return samples.maxOfOrNull { it.millis }
     }
 
-    data class Snapshot(val meanMs: Double, val stdMs: Double, val maxMs: Long)
+    @Synchronized
+    fun meanOver(horizon: Duration): Double? {
+        dropOlderThan(horizon)
+        return if (samples.isEmpty()) null else samples.sumOf { it.millis }.toDouble() / samples.size
+    }
+
+    @Synchronized
+    fun stdOver(horizon: Duration): Double? {
+        val mean = meanOver(horizon) ?: return null
+        return sqrt(samples.sumOf { (it.millis - mean) * (it.millis - mean) } / samples.size)
+    }
+
+    // Храним только замеры в пределах последнего запрошенного горизонта
+    private fun dropOlderThan(horizon: Duration) {
+        this.horizon = horizon
+        val oldest = System.currentTimeMillis() - horizon.toMillis()
+        while (samples.isNotEmpty() && samples.first().recordedAt < oldest) samples.removeFirst()
+    }
+
+    private data class Sample(val recordedAt: Long, val millis: Long)
 }
