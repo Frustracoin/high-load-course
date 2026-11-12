@@ -11,10 +11,10 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowReservations
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -38,7 +38,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    // Повторы делаем сами, с учётом лимитов и дедлайна; встроенный в OkHttp повтор при обрыве соединения
+    // отправил бы тот же запрос ещё раз в обход лимитера (и мог бы списать оплату дважды)
+    private val client = OkHttpClient.Builder().retryOnConnectionFailure(false).build()
 
     // Лимит провайдера - rateLimitPerSec за секунду, используем его полностью
     private val rateLimitWindow = Duration.ofSeconds(1)
@@ -48,6 +50,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelLimiter = Semaphore(parallelRequests, true)
 
     private val providerRequests = Metrics.counter("shop_provider_requests", "account", accountName)
+
+    private val retries = Metrics.counter("shop_payment_retries", "account", accountName)
 
     // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в наш rate limiter, либо в окно parallelRequests
     private val rateBound = rateLimitPerSec * 1000.0 / rateLimitWindow.toMillis()
@@ -84,6 +88,14 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        // Ошибки провайдера случайны и не связаны с нагрузкой, поэтому неудачную попытку сразу повторяем, пока не истёк дедлайн.
+        // Повтор идёт через те же rate limiter и семафор, что и первая попытка, - лимиты аккаунта не нарушаются
+        while (!attemptPayment(paymentId, amount, paymentStartedAt, deadline) && now() < deadline) {
+            retries.increment()
+        }
+    }
+
+    private fun attemptPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -98,31 +110,37 @@ class PaymentExternalSystemAdapterImpl(
 
         // Слот провайдера держим только на время самого вызова: запись результата в базу идёт уже после
         parallelLimiter.acquire()
-        val (code, rawBody) = try {
+        val body = try {
             rateLimiter.tickBlocking()
 
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+            // Deadline propagation: после дедлайна ответ уже никому не нужен - ни нам, ни провайдеру.
+            // Если дедлайн уже прошёл, платный вызов не делаем (да и timeout(0) у OkHttp значит "без ограничения")
+            val timeout = Duration.ofMillis(deadline - now())
+            if (timeout <= Duration.ZERO) {
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Deadline exceeded before sending.")
+            } else {
+                val request = Request.Builder().run {
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$timeout")
+                    post(emptyBody)
+                }.build()
 
-            providerRequests.increment()
-            client.newCall(request).execute().use { response -> response.code to response.body?.string() }
-        } catch (e: Exception) {
-            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = if (e is SocketTimeoutException) "Request timeout." else e.message)
+                providerRequests.increment()
+                val call = client.newCall(request).apply { timeout().timeout(timeout.toMillis(), TimeUnit.MILLISECONDS) }
+                call.execute().use { response ->
+                    val rawBody = response.body?.string()
+                    try {
+                        mapper.readValue(rawBody, ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "HTTP ${response.code}: $rawBody")
+                    }
+                }
             }
-            return
+        } catch (e: Exception) {
+            // Таймаут, обрыв соединения и т.п.
+            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message ?: e.javaClass.simpleName)
         } finally {
             parallelLimiter.release()
-        }
-
-        val body = try {
-            mapper.readValue(rawBody, ExternalSysResponse::class.java)
-        } catch (e: Exception) {
-            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: $code, reason: $rawBody")
-            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
         }
 
         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -132,6 +150,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logProcessing(body.result, now(), transactionId, reason = body.message)
         }
+        return body.result
     }
 
     override fun price() = properties.price
