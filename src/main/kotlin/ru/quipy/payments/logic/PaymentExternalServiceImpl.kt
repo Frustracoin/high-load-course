@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
@@ -45,7 +46,12 @@ class PaymentExternalSystemAdapterImpl(
 
     // Лимит провайдера - rateLimitPerSec за секунду, используем его полностью
     private val rateLimitWindow = Duration.ofSeconds(1)
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), rateLimitWindow)
+    // Провайдер считает окно по моменту прихода запроса, а наш лимитер - по моменту tick перед отправкой.
+    // При окне ровно rateLimitWindow запрос, ушедший сразу после освобождения слота, из-за разброса задержек
+    // может прийти к провайдеру раньше, чем самый старый выпал из его окна (c7-v4: 1 rate_limit_breached на первой попытке).
+    // Расписание sendSchedule уже держит запас POLL_INTERVAL, но повторы после таймаутов идут мимо него, только через
+    // этот лимитер, поэтому тот же запас нужен и здесь. Цена - ~1% пропускной способности (rateLimitPerSec за 1.01 с).
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), rateLimitWindow + SlidingWindowRateLimiter.POLL_INTERVAL)
 
     // Не больше parallelRequests запросов одновременно в полёте; fair - чтобы ожидающие шли по FIFO и ранние оплаты не опоздали к дедлайну
     private val parallelLimiter = Semaphore(parallelRequests, true)
@@ -65,10 +71,47 @@ class PaymentExternalSystemAdapterImpl(
     private val successLatency = providerLatency("success")
     private val failureLatency = providerLatency("failure")
 
-    // Тайм-аут одной попытки выбран по квантилям shop_provider_request_duration (прогон c7-v1 на acc-7, 1124 попытки):
-    // успешные ответы p50 0.58 с, p90 0.98 с, p99 1.08 с, max 1.09 с; позже 1.1 с успехов нет - дальше только зависания (~11% попыток).
-    // Берём p99 успешных + ~20% запаса = 1.3 с: успешные ответы не теряем, а в дедлайн 6 с влезает 4 полные попытки вместо 2.5
-    private val attemptTimeout = Duration.ofMillis(1300)
+    // Тайм-аут одной попытки не константа: он считается на ходу по квантилям успешных ответов (successLatency).
+    // Дольше p99 успешных ответов ждать бесполезно: если ответа к этому моменту нет, дальше обычно только зависание.
+    // Micrometer считает квантили по скользящему окну (distributionStatisticExpiry, по умолчанию 2 мин),
+    // поэтому тайм-аут следует за текущим профилем задержек провайдера и подходит любому аккаунту.
+    // Запас нужен, потому что попытки обрываем мы сами и ответы дольше тайм-аута в выборку успешных не попадают:
+    // без запаса p99 успешных, а вместе с ним и тайм-аут, сползали бы вниз.
+    private val attemptTimeoutMargin = 1.2
+    // Пока успешных замеров мало (холодный старт) или окно квантилей пустое - 2·avg из свойств аккаунта
+    private val attemptTimeoutMinSamples = 100L
+    private val coldStartAttemptTimeout = requestAverageProcessingTime.multipliedBy(2)
+    // Квантили пересчитываем не на каждую попытку, а не чаще раза в секунду: снимок гистограммы не бесплатный
+    private val attemptTimeoutRefresh = Duration.ofSeconds(1)
+    @Volatile private var currentAttemptTimeout = coldStartAttemptTimeout
+    @Volatile private var attemptTimeoutUpdatedAt = 0L
+
+    init {
+        // Текущий тайм-аут попытки - в Grafana
+        Gauge.builder("shop_provider_attempt_timeout", this) { it.currentAttemptTimeout.toMillis().toDouble() }
+            .tag("account", accountName)
+            .baseUnit("milliseconds")
+            .register(Metrics.globalRegistry)
+    }
+
+    private fun attemptTimeout(): Duration {
+        val now = now()
+        if (now - attemptTimeoutUpdatedAt >= attemptTimeoutRefresh.toMillis()) {
+            attemptTimeoutUpdatedAt = now
+            currentAttemptTimeout = computeAttemptTimeout()
+        }
+        return currentAttemptTimeout
+    }
+
+    private fun computeAttemptTimeout(): Duration {
+        if (successLatency.count() < attemptTimeoutMinSamples) return coldStartAttemptTimeout
+        val p99 = successLatency.takeSnapshot().percentileValues()
+            .firstOrNull { it.percentile() == 0.99 }
+            ?.value(TimeUnit.MILLISECONDS)
+        if (p99 == null || p99.isNaN() || p99 <= 0.0) return coldStartAttemptTimeout
+        // Ниже averageProcessingTime не опускаемся: обрывать попытки быстрее среднего ответа провайдера нельзя
+        return maxOf(Duration.ofMillis((p99 * attemptTimeoutMargin).toLong()), requestAverageProcessingTime)
+    }
 
     // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в наш rate limiter, либо в окно parallelRequests
     private val rateBound = rateLimitPerSec * 1000.0 / rateLimitWindow.toMillis()
@@ -134,7 +177,7 @@ class PaymentExternalSystemAdapterImpl(
             // Если дедлайн уже прошёл, платный вызов не делаем (да и timeout(0) у OkHttp значит "без ограничения")
             // Таймаут попытки: долгий хвост ответов обрываем на attemptTimeout (выбран по квантилям, см. выше), чтобы зависший вызов не держал
             // место в окне до самого дедлайна и оставалось время на повтор. Но не дольше, чем осталось до дедлайна
-            val timeout = minOf(attemptTimeout, Duration.ofMillis(deadline - now()))
+            val timeout = minOf(attemptTimeout(), Duration.ofMillis(deadline - now()))
             if (timeout <= Duration.ZERO) {
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Deadline exceeded before sending.")
             } else {
