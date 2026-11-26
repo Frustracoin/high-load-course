@@ -3720,6 +3720,99 @@
           ],
           "title": "(Online shop -> Payment system) retries rate (rps)",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "description": "Длительность одного вызова провайдера: квантили успешных ответов (по ним выбран тайм-аут попытки) и максимум отдельно для успешных и неуспешных/оборванных по тайм-ауту",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "lineWidth": 1,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 16
+          },
+          "id": 206,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.5, sum by (le, account) (rate(shop_provider_request_duration_seconds_bucket{outcome=\"success\"}[1m])))",
+              "legendFormat": "{{account}} success p50",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.9, sum by (le, account) (rate(shop_provider_request_duration_seconds_bucket{outcome=\"success\"}[1m])))",
+              "legendFormat": "{{account}} success p90",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, sum by (le, account) (rate(shop_provider_request_duration_seconds_bucket{outcome=\"success\"}[1m])))",
+              "legendFormat": "{{account}} success p99",
+              "range": true,
+              "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "max by (account, outcome) (shop_provider_request_duration_seconds_max)",
+              "legendFormat": "{{account}} {{outcome}} max",
+              "range": true,
+              "refId": "D"
+            }
+          ],
+          "title": "(Online shop -> Payment system) provider call duration (quantiles of success, max)",
+          "type": "timeseries"
         }
       ]
     }
