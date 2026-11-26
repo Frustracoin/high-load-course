@@ -59,6 +59,8 @@ data class PaymentAccountProperties(
     val price: Int,
     val averageProcessingTime: Duration = Duration.ofSeconds(11),
     val enabled: Boolean,
+    // Тайм-аут одной попытки вызова. Провайдер его не присылает - задаём сами: payment.attempt-timeout.<account>
+    val attemptTimeout: Duration? = null,
 )
 
 /**
