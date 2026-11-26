@@ -9,6 +9,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.RestartTimeoutEstimator
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowReservations
 import ru.quipy.core.EventSourcingService
@@ -60,8 +61,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val retries = Metrics.counter("shop_payment_retries", "account", accountName)
 
-    // Длительность одного вызова провайдера, отдельно для успешных и неуспешных (включая оборванные по таймауту).
-    // По квантилям успешных выбираем таймаут попытки: дольше них ждать бесполезно
+    // Длительность одного вызова провайдера, отдельно для успешных и неуспешных (включая оборванные по таймауту) - для Grafana.
+    // Тайм-аут попытки считается не по этим гистограммам, а по attemptTimeouts ниже
     private fun providerLatency(outcome: String) = Timer.builder("shop_provider_request_duration")
         .tag("account", accountName)
         .tag("outcome", outcome)
@@ -71,55 +72,35 @@ class PaymentExternalSystemAdapterImpl(
     private val successLatency = providerLatency("success")
     private val failureLatency = providerLatency("failure")
 
-    // Тайм-аут одной попытки не константа: он считается на ходу по квантилям успешных ответов (successLatency).
-    // Дольше p99 успешных ответов ждать бесполезно: если ответа к этому моменту нет, дальше обычно только зависание.
-    // Micrometer считает квантили по скользящему окну (distributionStatisticExpiry, по умолчанию 2 мин),
-    // поэтому тайм-аут следует за текущим профилем задержек провайдера и подходит любому аккаунту.
-    // Запас нужен, потому что попытки обрываем мы сами и ответы дольше тайм-аута в выборку успешных не попадают:
-    // без запаса p99 успешных, а вместе с ним и тайм-аут, сползали бы вниз.
-    private val attemptTimeoutMargin = 1.2
-    // Пока успешных замеров мало (холодный старт) или окно квантилей пустое - 2·avg из свойств аккаунта
-    private val attemptTimeoutMinSamples = 100L
-    private val coldStartAttemptTimeout = requestAverageProcessingTime.multipliedBy(2)
-    // Квантили пересчитываем не на каждую попытку, а не чаще раза в секунду: снимок гистограммы не бесплатный
-    private val attemptTimeoutRefresh = Duration.ofSeconds(1)
-    @Volatile private var currentAttemptTimeout = coldStartAttemptTimeout
-    @Volatile private var attemptTimeoutUpdatedAt = 0L
+    // Худшее время ответа: провайдер обещает среднее averageProcessingTime, ответ разбросан от нуля - значит, не дольше 2 * avg.
+    // Это же верхняя граница тайм-аута попытки: дольше ждать нечего
+    private val worstProcessingTime = requestAverageProcessingTime.multipliedBy(2)
+
+    // Тайм-аут одной попытки не константа: он выбирается по замерам так, чтобы успешный ответ обходился дешевле всего.
+    // Попытка с тайм-аутом t занимает слот min(D, t) и удаётся, если успешный ответ пришёл не позже t, так что цена успеха
+    // с учётом повторов - g(t) = E[min(D, t)] / P(успех не позже t). Зависания входят сюда честно: стоят t и ничего не дают.
+    // Ниже averageProcessingTime не опускаемся: обрывать попытки быстрее среднего ответа провайдера нельзя,
+    // да и по редким быстрым ответам g(t) оценивается слишком шумно. Подробности - в RestartTimeoutEstimator.
+    // Размер выборки - единственный статистический параметр: вероятности по ней оцениваются с шагом 1/windowSize.
+    // 100 попыток - шаг 1%: меньше - argmin прыгает по шуму, больше - дольше реагируем на смену профиля провайдера
+    private val attemptTimeouts = RestartTimeoutEstimator(
+        ceiling = worstProcessingTime,
+        floor = requestAverageProcessingTime,
+        windowSize = 100,
+    )
 
     init {
         // Текущий тайм-аут попытки - в Grafana
-        Gauge.builder("shop_provider_attempt_timeout", this) { it.currentAttemptTimeout.toMillis().toDouble() }
+        Gauge.builder("shop_provider_attempt_timeout", this) { it.attemptTimeouts.timeout().toMillis().toDouble() }
             .tag("account", accountName)
             .baseUnit("milliseconds")
             .register(Metrics.globalRegistry)
-    }
-
-    private fun attemptTimeout(): Duration {
-        val now = now()
-        if (now - attemptTimeoutUpdatedAt >= attemptTimeoutRefresh.toMillis()) {
-            attemptTimeoutUpdatedAt = now
-            currentAttemptTimeout = computeAttemptTimeout()
-        }
-        return currentAttemptTimeout
-    }
-
-    private fun computeAttemptTimeout(): Duration {
-        if (successLatency.count() < attemptTimeoutMinSamples) return coldStartAttemptTimeout
-        val p99 = successLatency.takeSnapshot().percentileValues()
-            .firstOrNull { it.percentile() == 0.99 }
-            ?.value(TimeUnit.MILLISECONDS)
-        if (p99 == null || p99.isNaN() || p99 <= 0.0) return coldStartAttemptTimeout
-        // Ниже averageProcessingTime не опускаемся: обрывать попытки быстрее среднего ответа провайдера нельзя
-        return maxOf(Duration.ofMillis((p99 * attemptTimeoutMargin).toLong()), requestAverageProcessingTime)
     }
 
     // Сколько оплат в секунду реально пропускает аккаунт: упираемся либо в наш rate limiter, либо в окно parallelRequests
     private val rateBound = rateLimitPerSec * 1000.0 / rateLimitWindow.toMillis()
     private val windowBound = parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis()
     private val throughputPerSec = minOf(rateBound, windowBound)
-
-    // Худшее время ответа: провайдер обещает среднее averageProcessingTime, ответ разбросан от нуля - значит, не дольше 2 * avg
-    private val worstProcessingTime = requestAverageProcessingTime.multipliedBy(2)
 
     // Входной лимитер: бронирует каждой принятой оплате момент отправки к провайдеру.
     // Если упираемся в rate limit - то же скользящее окно, что и на выходе, но длиннее на шаг опроса выходного лимитера:
@@ -175,9 +156,10 @@ class PaymentExternalSystemAdapterImpl(
 
             // Deadline propagation: после дедлайна ответ уже никому не нужен - ни нам, ни провайдеру.
             // Если дедлайн уже прошёл, платный вызов не делаем (да и timeout(0) у OkHttp значит "без ограничения")
-            // Таймаут попытки: долгий хвост ответов обрываем на attemptTimeout (выбран по квантилям, см. выше), чтобы зависший вызов не держал
+            // Таймаут попытки: долгий хвост ответов обрываем на тайм-ауте attemptTimeouts (выбран по замерам, см. выше), чтобы зависший вызов не держал
             // место в окне до самого дедлайна и оставалось время на повтор. Но не дольше, чем осталось до дедлайна
-            val timeout = minOf(attemptTimeout(), Duration.ofMillis(deadline - now()))
+            val attemptLimit = attemptTimeouts.timeout()
+            val timeout = minOf(attemptLimit, Duration.ofMillis(deadline - now()))
             if (timeout <= Duration.ZERO) {
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Deadline exceeded before sending.")
             } else {
@@ -200,10 +182,16 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                 } catch (e: Exception) {
-                    failureLatency.record(System.nanoTime() - startedAt, TimeUnit.NANOSECONDS)
+                    val elapsed = System.nanoTime() - startedAt
+                    failureLatency.record(elapsed, TimeUnit.NANOSECONDS)
+                    // Обрыв по тайм-ауту, разрыв соединения и т.п. - попытка заняла слот и успеха не дала.
+                    // Если тайм-аут урезан дедлайном, попытка шла не с выбранным тайм-аутом и о нём ничего не говорит
+                    if (timeout == attemptLimit) attemptTimeouts.record(attemptLimit, TimeUnit.NANOSECONDS.toMillis(elapsed), success = false)
                     throw e
                 }
-                (if (response.result) successLatency else failureLatency).record(System.nanoTime() - startedAt, TimeUnit.NANOSECONDS)
+                val elapsed = System.nanoTime() - startedAt
+                (if (response.result) successLatency else failureLatency).record(elapsed, TimeUnit.NANOSECONDS)
+                if (timeout == attemptLimit) attemptTimeouts.record(attemptLimit, TimeUnit.NANOSECONDS.toMillis(elapsed), response.result)
                 response
             }
         } catch (e: Exception) {
